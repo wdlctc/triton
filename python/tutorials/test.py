@@ -14,7 +14,8 @@ def matmul_kernel(x_ptr,  # *Pointer* to first input vector.
                   y_ptr,  # *Pointer* to second input vector.
                   output_ptr,  # *Pointer* to output vector.
                   n_elements,  # Size of the vector.
-                  stride, 
+                  xstride0, xstride1,
+                  ystride0, ystride1,
                   BLOCK_SIZE: tl.constexpr,  # Number of elements each program should process.
                   # NOTE: `constexpr` so it can be used as a shape value.
                   ):
@@ -24,27 +25,26 @@ def matmul_kernel(x_ptr,  # *Pointer* to first input vector.
     
     col_offsets = tl.arange(0, BLOCK_SIZE)
 
-
     x_start_ptr = x_ptr
-    x_ptrs = x_start_ptr + col_offsets
 
     y_start_ptr = y_ptr
-    y_ptrs = y_start_ptr + col_offsets
-    
-    # block_start = pid * BLOCK_SIZE
-    # offsets = block_start + tl.arange(0, BLOCK_SIZE)
-    # mask = offsets < n_elements
-    # mask_y = offsets[None, :] < n_elements
 
-    output = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
-    x = tl.load( x_start_ptr + col_offsets, mask=col_offsets < n_elements)
-    for k in range(0, n_elements):
-        y = tl.load( y_start_ptr + col_offsets, mask=col_offsets < n_elements)
-        output = x * y
-        output_sum = tl.sum(output)
-        tl.store(output_ptr, output_sum)
-        y_start_ptr += n_elements
-        output_ptr += 1
+    x_tile_ptr = tl.make_block_ptr(x_ptr, shape=(1, n_elements), strides=(xstride0, xstride1),
+                                   offsets=(0, 0), block_shape=(1, BLOCK_SIZE),
+                                   order=(1, 0))
+    y_tile_ptr = tl.make_block_ptr(y_ptr, shape=(n_elements, n_elements), strides=(ystride0, ystride1),
+                                   offsets=(0, 0), block_shape=(BLOCK_SIZE, BLOCK_SIZE),
+                                   order=(1, 0))
+    
+    x = tl.load(x_tile_ptr)
+    y = tl.load(y_tile_ptr)
+    output = x * y
+    o = tl.sum(output, 1)
+    
+    col_offsets = tl.arange(0, BLOCK_SIZE)
+    
+    tl.store(output_ptr + col_offsets, o, mask=col_offsets < n_elements)
+    
 
 
 def matmul(x: torch.Tensor, y: torch.Tensor):
@@ -52,20 +52,20 @@ def matmul(x: torch.Tensor, y: torch.Tensor):
     assert x.is_cuda and y.is_cuda and output.is_cuda
     n_elements = output.numel()
     grid = lambda meta: (triton.cdiv(n_elements, meta['BLOCK_SIZE']), )
-    matmul_kernel[grid](x, y, output, n_elements, x.stride(0), BLOCK_SIZE=16384)
+    matmul_kernel[grid](x, y, output, n_elements, x.stride(0), x.stride(1), y.stride(0), y.stride(1), BLOCK_SIZE=128)
     return output
 
 
 torch.manual_seed(0)
-size = 1024
+size = 128
 x = torch.rand((1, size), device='cuda')
 y = torch.rand((size, size), device='cuda').contiguous()
-
-output_triton = matmul(x, y)
 output_torch = torch.nn.functional.linear(x, y, bias=None)
+# y = torch.transpose(y, 0, 1).contiguous()
+output_triton = matmul(x, y)
+print(x,y)
 print(output_torch)
 print(output_triton)
-print(x,y)
 print(f'The maximum difference between torch and triton is '
       f'{torch.max(torch.abs(output_torch - output_triton))}')
 
@@ -74,7 +74,7 @@ print(f'The maximum difference between torch and triton is '
 @triton.testing.perf_report(
     triton.testing.Benchmark(
         x_names=['size'],  # Argument names to use as an x-axis for the plot.
-        x_vals=[16384],  # Different possible values for `x_name`.
+        x_vals=[128, 128, 128, 128, 128, 128],  # Different possible values for `x_name`.
         x_log=True,  # x axis is logarithmic.
         line_arg='provider',  # Argument name whose value corresponds to a different line in the plot.
         line_vals=['triton', 'torch'],  # Possible values for `line_arg`.
