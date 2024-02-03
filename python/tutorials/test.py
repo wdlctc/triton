@@ -1,69 +1,197 @@
 
-# %%
-# Compute Kernel
-# --------------
-
-import torch
 
 import triton
 import triton.language as tl
-
+import torch
+import torch.nn.functional as F
+import math 
 
 @triton.jit
-def matmul_kernel(x_ptr,  # *Pointer* to first input vector.
-                  y_ptr,  # *Pointer* to second input vector.
-                  output_ptr,  # *Pointer* to output vector.
-                  n_elements,  # Size of the vector.
-                  xstride0, xstride1,
-                  ystride0, ystride1,
-                  BLOCK_SIZE: tl.constexpr,  # Number of elements each program should process.
-                  # NOTE: `constexpr` so it can be used as a shape value.
-                  ):
-    # There are multiple 'programs' processing different data. We identify which program
-    # we are here:
-    pid = tl.program_id(axis=0)  # We use a 1D launch grid so axis is 0.
+def _fwd_kernel_flash_decode_stage1(
+    Q, K, V, seq_len, sm_scale,
+    Mid_O, Mid_O_LogExpSum,
+    stride_qbs, stride_qh, stride_qd,
+    stride_kbs, stride_kh, stride_kd,
+    stride_vbs, stride_vh, stride_vd,
+    BLOCK_DMODEL: tl.constexpr,
+    BLOCK_SEQ: tl.constexpr,
+    BLOCK_N: tl.constexpr
+):
+    cur_batch = tl.program_id(0)
+    seq_start_block = tl.program_id(1)
+
+    seq_start_index = seq_start_block * BLOCK_SEQ
+    seq_index = seq_start_block * BLOCK_DMODEL
+
+    offset_d = tl.arange(0, BLOCK_DMODEL)
+
+    offset_q = offset_d
+
+    offs_n = tl.arange(0, BLOCK_N)
+
+    block_n_size = BLOCK_SEQ // BLOCK_N
+
+    q = tl.load(Q + offset_q)
     
-    col_offsets = tl.arange(0, BLOCK_SIZE)
-
-    x_start_ptr = x_ptr
-
-    y_start_ptr = y_ptr
-
-    x_tile_ptr = tl.make_block_ptr(x_ptr, shape=(1, n_elements), strides=(xstride0, xstride1),
-                                   offsets=(0, 0), block_shape=(1, BLOCK_SIZE),
+    sum_exp = 0.0
+    max_logic = -float("inf")
+    acc = tl.zeros([BLOCK_DMODEL], dtype=tl.float32)
+    
+    k_tile_ptr = tl.make_block_ptr(base=K, shape=(seq_len, BLOCK_DMODEL), strides=(stride_kh, stride_kd),
+                                   offsets=(seq_start_index, 0), block_shape=(BLOCK_N, BLOCK_DMODEL),
                                    order=(1, 0))
-    y_tile_ptr = tl.make_block_ptr(y_ptr, shape=(n_elements, n_elements), strides=(ystride0, ystride1),
-                                   offsets=(0, 0), block_shape=(BLOCK_SIZE, BLOCK_SIZE),
+    v_tile_ptr = tl.make_block_ptr(base=V, shape=(seq_len, BLOCK_DMODEL), strides=(stride_vh, stride_vd),
+                                   offsets=(seq_start_index, 0), block_shape=(BLOCK_N, BLOCK_DMODEL),
                                    order=(1, 0))
-    
-    x = tl.load(x_tile_ptr)
-    y = tl.load(y_tile_ptr)
-    output = x * y
-    o = tl.sum(output, 1)
-    
-    col_offsets = tl.arange(0, BLOCK_SIZE)
-    
-    tl.store(output_ptr + col_offsets, o, mask=col_offsets < n_elements)
-    
 
+    for start_n in range(0, block_n_size, 1):
+        k = tl.load(k_tile_ptr)
 
-def matmul(x: torch.Tensor, y: torch.Tensor):
-    output = torch.empty_like(x)
-    assert x.is_cuda and y.is_cuda and output.is_cuda
-    n_elements = output.numel()
-    grid = lambda meta: (triton.cdiv(n_elements, meta['BLOCK_SIZE']), )
-    matmul_kernel[grid](x, y, output, n_elements, x.stride(0), x.stride(1), y.stride(0), y.stride(1), BLOCK_SIZE=128)
-    return output
+        att_value = tl.sum(q[None, :] * k, 1)
+        att_value *= sm_scale
+        
+        v = tl.load(v_tile_ptr)
+    
+        cur_max_logic = tl.max(att_value, axis=0)
+        new_max_logic = tl.maximum(cur_max_logic, max_logic)
 
+        exp_logic = tl.exp(att_value - new_max_logic)
+        logic_scale = tl.exp(max_logic - new_max_logic)
+        acc *= logic_scale
+        acc += tl.sum(exp_logic[:, None] * v, axis=0)
+
+        sum_exp = sum_exp * logic_scale + tl.sum(exp_logic, axis=0)
+        max_logic = new_max_logic
+
+    
+        k_tile_ptr = tl.advance(k_tile_ptr, (BLOCK_N, 0))
+        v_tile_ptr = tl.advance(v_tile_ptr, (BLOCK_N, 0))
+
+    off_o = offset_d
+    tl.store(Mid_O  + off_o + seq_index, acc / sum_exp)
+    tl.store(Mid_O_LogExpSum + seq_start_block, max_logic + tl.log(sum_exp))
+        
+
+@torch.no_grad()
+def flash_decoding_stage1(q, k, v):
+    BLOCK_SEQ = 256
+    BLOCK_N = 32
+    BLOCK_DMODEL = 2048
+    assert BLOCK_SEQ % BLOCK_N == 0
+    # shape constraints
+    Lq, Lk = q.shape[-1], k.shape[-1]
+    seq_len = k.shape[1]
+    sm_scale = 1.0 / (Lk ** 0.5)
+    batch = q.shape[0]
+    
+    grid = (batch, triton.cdiv(seq_len, BLOCK_SEQ))
+
+    O = torch.zeros((1, seq_len // BLOCK_SEQ, BLOCK_DMODEL), device=q.device)
+    LogExpSum = torch.zeros((seq_len // BLOCK_SEQ), device=q.device)
+    
+    _fwd_kernel_flash_decode_stage1[grid](q, k, v, seq_len, sm_scale ,
+                                          O, LogExpSum,
+                                          q.stride(0), q.stride(1), q.stride(2),
+                                          k.stride(0), k.stride(1), k.stride(2),
+                                          v.stride(0), v.stride(1), v.stride(2),
+                                          BLOCK_SEQ = BLOCK_SEQ, BLOCK_DMODEL=BLOCK_DMODEL, BLOCK_N = BLOCK_N)
+
+    return O, LogExpSum
+
+@triton.jit
+def _fwd_kernel_flash_decode_stage2(
+    Mid_O, Mid_O_LogExpSum,
+    O,
+    seq_len,
+    BLOCK_DMODEL: tl.constexpr,
+    BLOCK_SEQ: tl.constexpr,
+):
+    
+    cur_batch = tl.program_id(0)
+    offs_d = tl.arange(0, BLOCK_DMODEL)
+
+    sum_exp = 0.0
+    max_logic = -float("inf")
+    acc = tl.zeros([BLOCK_DMODEL], dtype=tl.float32)
+
+    block_n_size = seq_len // BLOCK_SEQ
+    for block_seq_n in range(0, block_n_size, 1):
+        tv = tl.load(Mid_O + offs_d + block_seq_n * BLOCK_DMODEL)
+        tlogic = tl.load(Mid_O_LogExpSum + block_seq_n)
+        
+        new_max_logic = tl.maximum(tlogic, max_logic)
+        
+        old_scale = tl.exp(max_logic - new_max_logic)
+        acc *= old_scale
+        exp_logic = tl.exp(tlogic - new_max_logic)
+        acc += exp_logic * tv
+        sum_exp = sum_exp * old_scale + exp_logic
+        max_logic = new_max_logic
+
+    tl.store(O + offs_d, acc / sum_exp)
+    return
+
+@torch.no_grad()
+def flash_decoding_stage2(mid_out, mid_out_logexpsum, O):
+    BLOCK_SEQ = 512
+    BLOCK_DMODEL = 2048
+
+    batch = O.shape[0]
+    seq_len = BLOCK_SEQ * mid_out_logexpsum.shape[0]
+
+    grid = lambda meta: (batch, )
+    
+    _fwd_kernel_flash_decode_stage2[grid](mid_out, mid_out_logexpsum, O,
+                                          seq_len, 
+                                          BLOCK_SEQ = BLOCK_SEQ, BLOCK_DMODEL=BLOCK_DMODEL)
+
+    return O
+
+def flash_decoding(q, cache_k, cache_v):
+    BLOCK_SEQ = 256
+    batch_size = 1
+    
+    output_tensor = torch.empty_like(q)
+    mid_out, mid_out_logexpsum = flash_decoding_stage1(q, cache_k, cache_v)
+    output_tensor = flash_decoding_stage2(mid_out, mid_out_logexpsum, output_tensor)
+
+    return output_tensor
+
+class ScaledDotProductAttention(torch.nn.Module):
+    def __init__(self):
+        super(ScaledDotProductAttention, self).__init__()
+
+    def forward(self, query, key, value):
+        # Ensure query, key, value are in the format (batch_size, seq_len, hidden_dim)
+        # For the sake of this example, we're assuming they are already correctly formatted
+        
+        # Step 2: Calculate the dot products of the query with all keys
+        # matmul_qk shape: (batch_size, seq_len_query, seq_len_key)
+        matmul_qk = torch.matmul(query, key.transpose(-2, -1))
+        
+        # Step 3: Scale the dot-products
+        d_k = query.size(-1)  # dimension of the keys
+        scaled_attention_logits = matmul_qk / math.sqrt(d_k)
+
+        # Step 4: Apply softmax to get the weights
+        # attention_weights shape: (batch_size, seq_len_query, seq_len_key)
+        attention_weights = F.softmax(scaled_attention_logits, dim=-1)
+
+        # Step 5: Multiply by the values to get the final output
+        # output shape: (batch_size, seq_len_query, hidden_dim)
+        output = torch.matmul(attention_weights, value)
+
+        return output, attention_weights
 
 torch.manual_seed(0)
-size = 128
-x = torch.rand((1, size), device='cuda')
-y = torch.rand((size, size), device='cuda').contiguous()
-output_torch = torch.nn.functional.linear(x, y, bias=None)
-# y = torch.transpose(y, 0, 1).contiguous()
-output_triton = matmul(x, y)
-print(x,y)
+sequence = 2048
+size = 2048
+q = torch.rand((1, 1, size), device='cuda')
+k = torch.rand((1, sequence, size), device='cuda')
+v = torch.rand((1, sequence, size), device='cuda')
+attention = ScaledDotProductAttention()
+output_torch, attention_weights = attention(q, k, v)
+output_triton = flash_decoding(q,k,v)
 print(output_torch)
 print(output_triton)
 print(f'The maximum difference between torch and triton is '
@@ -74,7 +202,7 @@ print(f'The maximum difference between torch and triton is '
 @triton.testing.perf_report(
     triton.testing.Benchmark(
         x_names=['size'],  # Argument names to use as an x-axis for the plot.
-        x_vals=[128, 128, 128, 128, 128, 128],  # Different possible values for `x_name`.
+        x_vals=[2**i for i in range(12, 20, 1)],  # Different possible values for `x_name`.
         x_log=True,  # x axis is logarithmic.
         line_arg='provider',  # Argument name whose value corresponds to a different line in the plot.
         line_vals=['triton', 'torch'],  # Possible values for `line_arg`.
@@ -85,13 +213,14 @@ print(f'The maximum difference between torch and triton is '
         args={},  # Values for function arguments not in `x_names` and `y_name`.
     ))
 def benchmark(size, provider):
-    x = torch.rand((1, size), device='cuda', dtype=torch.float32)
-    y = torch.rand((size, size), device='cuda', dtype=torch.float32)
+    q = torch.rand((1, 1, 2048), device='cuda')
+    k = torch.rand((1, size, 2048), device='cuda')
+    v = torch.rand((1, size, 2048), device='cuda')
     quantiles = [0.5, 0.2, 0.8]
     if provider == 'torch':
-        ms, min_ms, max_ms = triton.testing.do_bench(lambda: torch.nn.functional.linear(x, y, bias=None), quantiles=quantiles)
+        ms, min_ms, max_ms = triton.testing.do_bench(lambda: attention(q, k, v), quantiles=quantiles)
     if provider == 'triton':
-        ms, min_ms, max_ms = triton.testing.do_bench(lambda: matmul(x, y), quantiles=quantiles)
+        ms, min_ms, max_ms = triton.testing.do_bench(lambda: flash_decoding(q,k,v), quantiles=quantiles)
     gbps = lambda ms: 12 * size / ms * 1e-6
     return gbps(ms), gbps(max_ms), gbps(min_ms)
 
