@@ -75,7 +75,7 @@ def _fwd_kernel_flash_decode_stage1(
 @torch.no_grad()
 def flash_decoding_stage1(q, k, v):
     BLOCK_SEQ = 256
-    BLOCK_N = 32
+    BLOCK_N = 16
     BLOCK_DMODEL = 2048
     assert BLOCK_SEQ % BLOCK_N == 0
     # shape constraints
@@ -94,7 +94,8 @@ def flash_decoding_stage1(q, k, v):
                                           q.stride(0), q.stride(1), q.stride(2),
                                           k.stride(0), k.stride(1), k.stride(2),
                                           v.stride(0), v.stride(1), v.stride(2),
-                                          BLOCK_SEQ = BLOCK_SEQ, BLOCK_DMODEL=BLOCK_DMODEL, BLOCK_N = BLOCK_N)
+                                          BLOCK_SEQ = BLOCK_SEQ, BLOCK_DMODEL=BLOCK_DMODEL, BLOCK_N = BLOCK_N,
+                                          num_warps = 16)
 
     return O, LogExpSum
 
@@ -133,7 +134,7 @@ def _fwd_kernel_flash_decode_stage2(
 
 @torch.no_grad()
 def flash_decoding_stage2(mid_out, mid_out_logexpsum, O):
-    BLOCK_SEQ = 512
+    BLOCK_SEQ = 256
     BLOCK_DMODEL = 2048
 
     batch = O.shape[0]
@@ -148,12 +149,11 @@ def flash_decoding_stage2(mid_out, mid_out_logexpsum, O):
     return O
 
 def flash_decoding(q, cache_k, cache_v):
-    BLOCK_SEQ = 256
     batch_size = 1
     
     output_tensor = torch.empty_like(q)
     mid_out, mid_out_logexpsum = flash_decoding_stage1(q, cache_k, cache_v)
-    output_tensor = flash_decoding_stage2(mid_out, mid_out_logexpsum, output_tensor)
+    # output_tensor = flash_decoding_stage2(mid_out, mid_out_logexpsum, output_tensor)
 
     return output_tensor
 
@@ -202,7 +202,7 @@ print(f'The maximum difference between torch and triton is '
 @triton.testing.perf_report(
     triton.testing.Benchmark(
         x_names=['size'],  # Argument names to use as an x-axis for the plot.
-        x_vals=[2**i for i in range(12, 20, 1)],  # Different possible values for `x_name`.
+        x_vals=[2**i for i in range(12, 23, 1)],  # Different possible values for `x_name`.
         x_log=True,  # x axis is logarithmic.
         line_arg='provider',  # Argument name whose value corresponds to a different line in the plot.
         line_vals=['triton', 'torch'],  # Possible values for `line_arg`.
