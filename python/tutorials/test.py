@@ -13,6 +13,8 @@ def _fwd_kernel_flash_decode_stage1(
     stride_qbs, stride_qh, stride_qd,
     stride_kbs, stride_kh, stride_kd,
     stride_vbs, stride_vh, stride_vd,
+    stride_obs, stride_oh, stride_od,
+    stride_lbs, stride_lh,
     BLOCK_DMODEL: tl.constexpr,
     BLOCK_SEQ: tl.constexpr,
     BLOCK_N: tl.constexpr
@@ -31,16 +33,16 @@ def _fwd_kernel_flash_decode_stage1(
 
     block_n_size = BLOCK_SEQ // BLOCK_N
 
-    q = tl.load(Q + offset_q)
+    q = tl.load(Q + offset_q + cur_batch * stride_qbs)
     
     sum_exp = 0.0
     max_logic = -float("inf")
     acc = tl.zeros([BLOCK_DMODEL], dtype=tl.float32)
     
-    k_tile_ptr = tl.make_block_ptr(base=K, shape=(seq_len, BLOCK_DMODEL), strides=(stride_kh, stride_kd),
+    k_tile_ptr = tl.make_block_ptr(base=K + cur_batch * stride_kbs, shape=(seq_len, BLOCK_DMODEL), strides=(stride_kh, stride_kd),
                                    offsets=(seq_start_index, 0), block_shape=(BLOCK_N, BLOCK_DMODEL),
                                    order=(1, 0))
-    v_tile_ptr = tl.make_block_ptr(base=V, shape=(seq_len, BLOCK_DMODEL), strides=(stride_vh, stride_vd),
+    v_tile_ptr = tl.make_block_ptr(base=V + cur_batch * stride_vbs, shape=(seq_len, BLOCK_DMODEL), strides=(stride_vh, stride_vd),
                                    offsets=(seq_start_index, 0), block_shape=(BLOCK_N, BLOCK_DMODEL),
                                    order=(1, 0))
 
@@ -68,8 +70,8 @@ def _fwd_kernel_flash_decode_stage1(
         v_tile_ptr = tl.advance(v_tile_ptr, (BLOCK_N, 0))
 
     off_o = offset_d
-    tl.store(Mid_O  + off_o + seq_index, acc / sum_exp)
-    tl.store(Mid_O_LogExpSum + seq_start_block, max_logic + tl.log(sum_exp))
+    tl.store(Mid_O  + off_o + seq_index + cur_batch * stride_obs, acc / sum_exp)
+    tl.store(Mid_O_LogExpSum + seq_start_block + cur_batch * stride_lbs, max_logic + tl.log(sum_exp))
         
 
 @torch.no_grad()
@@ -86,14 +88,16 @@ def flash_decoding_stage1(q, k, v):
     
     grid = (batch, triton.cdiv(seq_len, BLOCK_SEQ))
 
-    O = torch.zeros((1, seq_len // BLOCK_SEQ, BLOCK_DMODEL), device=q.device)
-    LogExpSum = torch.zeros((seq_len // BLOCK_SEQ), device=q.device)
+    O = torch.zeros((batch, seq_len // BLOCK_SEQ, BLOCK_DMODEL), device=q.device)
+    LogExpSum = torch.zeros((batch, seq_len // BLOCK_SEQ), device=q.device)
     
     _fwd_kernel_flash_decode_stage1[grid](q, k, v, seq_len, sm_scale ,
                                           O, LogExpSum,
                                           q.stride(0), q.stride(1), q.stride(2),
                                           k.stride(0), k.stride(1), k.stride(2),
                                           v.stride(0), v.stride(1), v.stride(2),
+                                          O.stride(0), O.stride(1), O.stride(2),
+                                          LogExpSum.stride(0), LogExpSum.stride(1),
                                           BLOCK_SEQ = BLOCK_SEQ, BLOCK_DMODEL=BLOCK_DMODEL, BLOCK_N = BLOCK_N,
                                           num_warps = 16)
 
@@ -103,6 +107,9 @@ def flash_decoding_stage1(q, k, v):
 def _fwd_kernel_flash_decode_stage2(
     Mid_O, Mid_O_LogExpSum,
     O,
+    stride_obs, stride_oh, stride_od,
+    stride_qbs, stride_qh, stride_qd,
+    stride_lbs, stride_lh,
     seq_len,
     BLOCK_DMODEL: tl.constexpr,
     BLOCK_SEQ: tl.constexpr,
@@ -117,8 +124,8 @@ def _fwd_kernel_flash_decode_stage2(
 
     block_n_size = seq_len // BLOCK_SEQ
     for block_seq_n in range(0, block_n_size, 1):
-        tv = tl.load(Mid_O + offs_d + block_seq_n * BLOCK_DMODEL)
-        tlogic = tl.load(Mid_O_LogExpSum + block_seq_n)
+        tv = tl.load(Mid_O + offs_d + block_seq_n * BLOCK_DMODEL + cur_batch * stride_qbs)
+        tlogic = tl.load(Mid_O_LogExpSum + block_seq_n + cur_batch * stride_lbs)
         
         new_max_logic = tl.maximum(tlogic, max_logic)
         
@@ -129,7 +136,7 @@ def _fwd_kernel_flash_decode_stage2(
         sum_exp = sum_exp * old_scale + exp_logic
         max_logic = new_max_logic
 
-    tl.store(O + offs_d, acc / sum_exp)
+    tl.store(O + offs_d + cur_batch * stride_obs, acc / sum_exp)
     return
 
 @torch.no_grad()
@@ -138,11 +145,14 @@ def flash_decoding_stage2(mid_out, mid_out_logexpsum, O):
     BLOCK_DMODEL = 2048
 
     batch = O.shape[0]
-    seq_len = BLOCK_SEQ * mid_out_logexpsum.shape[0]
+    seq_len = BLOCK_SEQ * mid_out_logexpsum.shape[-1]
 
     grid = lambda meta: (batch, )
     
     _fwd_kernel_flash_decode_stage2[grid](mid_out, mid_out_logexpsum, O,
+                                          O.stride(0), O.stride(1), O.stride(2),
+                                          mid_out.stride(0), mid_out.stride(1), mid_out.stride(2),
+                                          mid_out_logexpsum.stride(0), mid_out_logexpsum.stride(1),
                                           seq_len, 
                                           BLOCK_SEQ = BLOCK_SEQ, BLOCK_DMODEL=BLOCK_DMODEL)
 
@@ -153,7 +163,7 @@ def flash_decoding(q, cache_k, cache_v):
     
     output_tensor = torch.empty_like(q)
     mid_out, mid_out_logexpsum = flash_decoding_stage1(q, cache_k, cache_v)
-    # output_tensor = flash_decoding_stage2(mid_out, mid_out_logexpsum, output_tensor)
+    output_tensor = flash_decoding_stage2(mid_out, mid_out_logexpsum, output_tensor)
 
     return output_tensor
 
@@ -186,9 +196,9 @@ class ScaledDotProductAttention(torch.nn.Module):
 torch.manual_seed(0)
 sequence = 2048
 size = 2048
-q = torch.rand((1, 1, size), device='cuda')
-k = torch.rand((1, sequence, size), device='cuda')
-v = torch.rand((1, sequence, size), device='cuda')
+q = torch.rand((2, 1, size), device='cuda')
+k = torch.rand((2, sequence, size), device='cuda')
+v = torch.rand((2, sequence, size), device='cuda')
 attention = ScaledDotProductAttention()
 output_torch, attention_weights = attention(q, k, v)
 output_triton = flash_decoding(q,k,v)
@@ -202,7 +212,7 @@ print(f'The maximum difference between torch and triton is '
 @triton.testing.perf_report(
     triton.testing.Benchmark(
         x_names=['size'],  # Argument names to use as an x-axis for the plot.
-        x_vals=[2**i for i in range(12, 23, 1)],  # Different possible values for `x_name`.
+        x_vals=[2**i for i in range(12, 14, 1)],  # Different possible values for `x_name`.
         x_log=True,  # x axis is logarithmic.
         line_arg='provider',  # Argument name whose value corresponds to a different line in the plot.
         line_vals=['triton', 'torch'],  # Possible values for `line_arg`.
@@ -213,9 +223,9 @@ print(f'The maximum difference between torch and triton is '
         args={},  # Values for function arguments not in `x_names` and `y_name`.
     ))
 def benchmark(size, provider):
-    q = torch.rand((1, 1, 2048), device='cuda')
-    k = torch.rand((1, size, 2048), device='cuda')
-    v = torch.rand((1, size, 2048), device='cuda')
+    q = torch.rand((128, 1, 2048), device='cuda')
+    k = torch.rand((128, size, 2048), device='cuda')
+    v = torch.rand((128, size, 2048), device='cuda')
     quantiles = [0.5, 0.2, 0.8]
     if provider == 'torch':
         ms, min_ms, max_ms = triton.testing.do_bench(lambda: attention(q, k, v), quantiles=quantiles)
